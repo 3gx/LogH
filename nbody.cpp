@@ -1,6 +1,10 @@
 #include <cstdlib>
 
+#if 0
 #include "LogH.h"
+#else
+#include "LogH+TTL.h"
+#endif
 #include "kepler.h"
 #include "mytimer.h"
 

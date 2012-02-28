@@ -42,4 +42,4 @@ clean:
 	/bin/rm -rf *.o version.h
 	/bin/rm -rf $(PROG) lib$(VLIB).a
 
-$(OBJS) : LogH.h particle.h vector3.h kepler.h 
+$(OBJS) : LogH.h LogH+TTL.h particle.h vector3.h kepler.h 

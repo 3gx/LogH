@@ -1,5 +1,5 @@
-#ifndef __LOGH_H__
-#define __LOGH_H__
+#ifndef __LogH_TTL_H__
+#define __LogH_TTL_H__
 
 #include <sstream>
 #include <vector>
@@ -10,13 +10,6 @@
 /* use this one if run on x86_64 */
 #if 1
 #define _SSE_
-#endif
-
-#if 0
-#ifdef _SSE_
-#error "_SSE_ is not supported with _SYMPCORR_"
-#endif
-#define _SYMPCORR_
 #endif
 
 /* use this option to compute forces in N^2/s steps rather than N^2 steps */
@@ -39,23 +32,30 @@
 struct Force
 {
   typedef std::vector<Force, __gnu_cxx::malloc_allocator<Force, 64> > Vector;
-  vec3 acc, iPad;
+  vec3 acc, dW;
+  double iPad1, iPad2;
   Force() {}
   Force(const vec3 &_acc) : acc(_acc) {}
+  Force(const vec3 &_acc, const vec3 &_dW) : acc(_acc), dW(_dW) {}
 };
 
 #ifdef _SSE_
 struct ForceSIMD
 {
-  typedef std::vector<ForceSIMD, __gnu_cxx::malloc_allocator<ForceSIMD, 64> > Vector;
-  v2df accx, accy, accz, iPad;
+  typedef std::vector<ForceSIMD, __gnu_cxx::malloc_allocator<ForceSIMD, 128> > Vector;
+  v2df accx, accy, accz;
+  v2df dWx,  dWy,  dWz;
+  v2df iPad1, iPad2;
   ForceSIMD() {}
   ForceSIMD(const real v) 
   {
-    accx = accy = accz = iPad = (v2df){v, v};
+    accx = accy = accz = (v2df){v, v};
+    dWx  = dWy  = dWz  = (v2df){v, v};
   }
 };
 #endif
+
+
 
 struct Nbody
 {
@@ -78,7 +78,10 @@ struct Nbody
   double dt_step, dt_multi, dt_extra, dt_err;
 
   real dt;
-  real negE0;
+  real Etot0;
+  real B, W;
+
+  real Alpha, Beta, Gamma;
 
   void reset_counters()
   {
@@ -87,6 +90,19 @@ struct Nbody
     dt_force = 0.0;
     dt_step = dt_multi = dt_extra = dt_err = 0.0;
     tbeg = mytimer::get_wtime();
+    Alpha = 1.0;
+    Beta  = 0.0e-3;
+    Gamma = 0.0;
+
+#if 0
+    Alpha = 0.0;
+    Beta  = 1.0;
+#endif
+
+#if 0
+    Alpha = 0.5;
+    Beta  = 0.5;
+#endif
   }
 
   real get_gflops() const
@@ -104,6 +120,7 @@ struct Nbody
   Nbody(const unsigned long long i, const real tepoch, const real _h, const Particle::Vector &_ptcl) : 
     iteration(i), time(tepoch), h(_h), ptcl(_ptcl) 
   {
+    assert(ptcl.size() > 1);
     reset_counters();
     force.resize(ptcl.size());
     vec3 cm_pos(0.0), cm_vel(0.0);
@@ -131,7 +148,19 @@ struct Nbody
     forceSIMD.resize(ptclSIMD.size());
 #endif
 
-    negE0 = -Etot();
+#ifdef _SSE_
+    const int nbody = ptcl.size();
+    for (int i = 0; i < nbody; i += 2)
+      ptclSIMD[i>>1] = ParticleSIMD(&ptcl[i]);
+    v2df W1, W2;
+    compute_force(ptclSIMD, forceSIMD, W1, W2);
+    W = __builtin_ia32_vec_ext_v2df(W2, 0);
+#else
+    compute_force(ptcl, force, B, W);
+#endif
+
+    Etot0 = Etot();
+    B = -Etot0;
   }
 
   real Ekin(const Particle::Vector &ptcl) const
@@ -145,6 +174,7 @@ struct Nbody
     }
     return Ekin;
   }
+  
 
   real Epot() const { return Epot(ptcl); }
   real Ekin() const { return Ekin(ptcl); }
@@ -165,7 +195,7 @@ struct Nbody
   }
 
   real Etot() const {return Ekin(ptcl) + Epot(ptcl);}
-  real E0  () const {return -negE0;}
+  real E0  () const {return Etot0;}
 
   std::string print_orbit(const int i) const
   {
@@ -254,174 +284,59 @@ struct Nbody
 
 #ifndef _SSE_
 
-  real compute_force(const Particle::Vector &ptcl, Force::Vector &force)
+  void compute_force(const Particle::Vector &ptcl, Force::Vector &force, real &U, real &Omega)
   {
     const int PP_FLOP = 38;
     const int n = ptcl.size();
     const double t0 = mytimer::get_wtime();
-    real Utot = 0.0;
-
-#ifdef _N2FAST_
-
-    for (int i = 0; i < n; i++)
-      force[i] = Force(0.0);
-
-    for (int i = 0; i < n-1; i++)
-      for (int j = i+1; j < n; j++)
-      {
-        const vec3 dr   = ptcl[j].pos - ptcl[i].pos;
-        const real r2   = dr*dr;
-        const real rinv = 1.0/std::sqrt(r2);
-        const real rinv1 = rinv * ptcl[i].mass*ptcl[j].mass;
-        const real rinv2 = rinv*rinv;
-        const real rinv3 = rinv1*rinv2;
-
-        const real pot = rinv1;
-        const vec3 acc = rinv3 * dr;
-        force[i].acc += acc;
-        force[j].acc -= acc;
-        Utot         += pot;
-      }
-
-    for (int i = 0; i < n; i++)
-      force[i].acc *= 1.0/ptcl[i].mass;
-
-#else /* _N2FAST_ */
+    U = Omega = 0.0;
 
     for (int i = 0; i < n; i++)
     {
       const Particle &pi = ptcl[i];
-      vec3 iacc(0.0);
-      real ipot(0.0);
+      Force iforce(0.0, 0.0);
       for (int j = 0; j < n; j++)
       {
         const Particle &pj = ptcl[j];
         if (i == j) continue;
 
-        const vec3   dr = pj.pos - pi.pos;    
-        const real   r2 = dr*dr;             
-        const real rinv2 = 1.0/r2;          
-        const real rinv1 = pj.mass * std::sqrt(rinv2);  
-        const real rinv3 = rinv1*rinv2;                
+        const vec3 dr = pj.pos - pi.pos;    
+        const real r2 = dr*dr;             
 
-        const real pot = rinv1; 
-        const vec3 acc = rinv3 * dr;      
+        const real rinv1 = 1.0/std::sqrt(r2);
+        const real rinv2 = rinv1*rinv1;
+        const real rinv3 = rinv1*rinv2;
+        
+        const vec3 aij = rinv3*dr;
 
-        iacc += acc;                     
-        ipot += pot;                    
+        iforce.acc += pj.mass*aij;
+        U          += 0.5*pi.mass*pj.mass*rinv1;
+
+        iforce.dW  +=       aij;
+        Omega      += 0.5*rinv1;
       }                                
-      force[i] = Force(iacc);
-      Utot    += 0.5*pi.mass*ipot;
+      force[i] = iforce;
     }
 
-#endif /* _N2FAST_ */
-
-    Utot = -Utot;
     dt_force += mytimer::get_wtime() - t0;
     flops += PP_FLOP*n*n;
-    return Utot;
   }
 
 #else /* _SSE_ */
 
-  v2df compute_force(const ParticleSIMD::Vector &ptcl, ForceSIMD::Vector &force) 
+  void compute_force(const ParticleSIMD::Vector &ptcl, ForceSIMD::Vector &force, v2df &U, v2df &Omega)
   {
     const int PP_FLOP = 38;
-
-#ifdef _N2FAST_
-
+    
     asm("#SSE-checkpoint1"); 
     const double t0 = mytimer::get_wtime();
     const int n  = this->ptcl.size();
     assert((n&1) == 0);
-
+    
     const int nh = n >> 1;
 
-    for (int i = 0; i < nh; i++)
-      force[i] = ForceSIMD(0.0);
+    U = Omega = (v2df){0.0, 0.0};
 
-    v2df simdU = {0.0, 0.0};
-    for (int i = 0; i < nh; i++)
-      for (int j = i; j < nh; j++)
-      {
-        asm("#SSE-checkpoint3a"); 
-
-        const ParticleSIMD pi = ptcl[i];
-        const ParticleSIMD p1(  ptcl[j], true );
-        const ParticleSIMD p2(  ptcl[j], false);
-
-        const v2df dx_1 = p1.posx - pi.posx;
-        const v2df dy_1 = p1.posy - pi.posy;
-        const v2df dz_1 = p1.posz - pi.posz;
-        const v2df r2_1 = dx_1*dx_1 + dy_1*dy_1 + dz_1*dz_1;   
-
-        const v2df dx_2 = p2.posx - pi.posx;
-        const v2df dy_2 = p2.posy - pi.posy;
-        const v2df dz_2 = p2.posz - pi.posz;
-        const v2df r2_2 = dx_2*dx_2 + dy_2*dy_2 + dz_2*dz_2;   
-
-        v2df rinv_1 = r2_1;
-        v2df rinv_2 = r2_2;
-        __rsqrtpd(rinv_1, rinv_2);
-
-        const long long Imask = -(i!=j);
-        const v2di mask = (v2di){Imask, Imask};
-
-        const v2df rinv1_1 = __builtin_ia32_andpd((v2df)mask, pi.mass*p1.mass * rinv_1);
-        const v2df rinv1_2 =                                  pi.mass*p2.mass * rinv_2 ;
-        const v2df rinv3_1 = rinv_1*rinv_1 * rinv1_1;
-        const v2df rinv3_2 = rinv_2*rinv_2 * rinv1_2;
-
-        simdU += rinv1_1 + rinv1_2;
-
-        const v2df fx_1233 = rinv3_1*dx_1;
-        const v2df fx_1244 = rinv3_2*dx_2;
-        const v2df fy_1233 = rinv3_1*dy_1;
-        const v2df fy_1244 = rinv3_2*dy_2;
-        const v2df fz_1233 = rinv3_1*dz_1;
-        const v2df fz_1244 = rinv3_2*dz_2;
-
-        force[i].accx += fx_1233 + fx_1244;
-        force[i].accy += fy_1233 + fy_1244;
-        force[i].accz += fz_1233 + fz_1244;
-
-        const v2df fx_3411 = __builtin_ia32_unpcklpd(fx_1233, fx_1244);
-        const v2df fx_3422 = __builtin_ia32_unpckhpd(fx_1233, fx_1244);
-        const v2df fy_3411 = __builtin_ia32_unpcklpd(fy_1233, fy_1244);
-        const v2df fy_3422 = __builtin_ia32_unpckhpd(fy_1233, fy_1244);
-        const v2df fz_3411 = __builtin_ia32_unpcklpd(fz_1233, fz_1244);
-        const v2df fz_3422 = __builtin_ia32_unpckhpd(fz_1233, fz_1244);
-
-        force[j].accx -= fx_3411 + fx_3422;
-        force[j].accy -= fy_3411 + fy_3422;
-        force[j].accz -= fz_3411 + fz_3422;
-
-        asm("#SSE-checkpoint3b"); 
-      }
-
-    for (int i = 0; i < nh; i++)
-    {
-      const v2df invM = (v2df){1.0, 1.0}/ptcl[i].mass;
-      force[i].accx *= invM;
-      force[i].accy *= invM;
-      force[i].accz *= invM;
-    }
-    asm("#SSE-checkpoint4"); 
-    const real Utot = __builtin_ia32_vec_ext_v2df(__builtin_ia32_haddpd(simdU, simdU), 0);
-
-#else /* _N2FAST_ */
-
-    asm("#SSE-checkpoint1"); 
-    const double t0 = mytimer::get_wtime();
-    const int n  = this->ptcl.size();
-    assert((n&1) == 0);
-
-    const int nh = n >> 1;
-
-    for (int i = 0; i < nh; i++)
-      force[i] = ForceSIMD(0.0);
-
-    v2df simdU = {0.0, 0.0};
     for (int i = 0; i < nh; i++)
     {
       asm("#SSE-checkpoint2"); 
@@ -430,10 +345,13 @@ struct Nbody
       v2df accx = {0.0, 0.0};
       v2df accy = {0.0, 0.0};
       v2df accz = {0.0, 0.0};
+      v2df dWx  = {0.0, 0.0};
+      v2df dWy  = {0.0, 0.0};
+      v2df dWz  = {0.0, 0.0};
       for (int j = 0; j < nh; j++)
       {
         asm("#SSE-checkpoint3a"); 
-
+        
         const ParticleSIMD p1(ptcl[j], true);
         const ParticleSIMD p2(ptcl[j], false);
 
@@ -447,245 +365,71 @@ struct Nbody
         const v2df dz_2 = p2.posz - pi.posz;
         const v2df r2_2 = dx_2*dx_2 + dy_2*dy_2 + dz_2*dz_2;   
 
-        v2df rinv_1 = r2_1;
-        v2df rinv_2 = r2_2;
-        __rsqrtpd(rinv_1, rinv_2);
+        v2df rinv1_1 = r2_1;
+        v2df rinv1_2 = r2_2;
+        __rsqrtpd(rinv1_1, rinv1_2);
 
-        const v2df rinv1_1 = p1.mass * rinv_1;
-        const v2df rinv2_1 = rinv_1*rinv_1;
-        const v2df rinv3_1 = rinv2_1 * rinv1_1;
-        const v2df rinv1_2 = p2.mass * rinv_2;
-        const v2df rinv2_2 = rinv_2*rinv_2;
-        const v2df rinv3_2 = rinv2_2 * rinv1_2;
+        const v2df rinv2_1 = rinv1_1 * rinv1_1;
+        const v2df rinv3_1 = rinv1_1 * rinv2_1;
+        const v2df rinv2_2 = rinv1_2 * rinv1_2;
+        const v2df rinv3_2 = rinv1_2 * rinv2_2;
+        
+        const v2df ax1 = rinv3_1*dx_1;
+        const v2df ay1 = rinv3_1*dy_1;
+        const v2df az1 = rinv3_1*dz_1;
+        
+        const v2df ax2 = rinv3_2*dx_2;
+        const v2df ay2 = rinv3_2*dy_2;
+        const v2df az2 = rinv3_2*dz_2;
+        
+        const v2df mrinv1_1 = p1.mass*rinv1_1;
+        const v2df mrinv3_1 = mrinv1_1 * rinv2_1;
+        const v2df mrinv1_2 = p2.mass*rinv1_2;
+        const v2df mrinv3_2 = mrinv1_2 * rinv2_2;
 
-        simdU += (v2df){0.5, 0.5}*pi.mass*(rinv1_1 + rinv1_2);
-        accx += rinv3_1 * dx_1 + rinv3_2*dx_2;
-        accy += rinv3_1 * dy_1 + rinv3_2*dy_2;
-        accz += rinv3_1 * dz_1 + rinv3_2*dz_2;
+        const v2df max1 = mrinv3_1*dx_1;
+        const v2df may1 = mrinv3_1*dy_1;
+        const v2df maz1 = mrinv3_1*dz_1;
+        
+        const v2df max2 = mrinv3_2*dx_2;
+        const v2df may2 = mrinv3_2*dy_2;
+        const v2df maz2 = mrinv3_2*dz_2;
+        
+        U    += (v2df){0.5, 0.5}*pi.mass*(mrinv1_1 + mrinv1_2);
+        accx += max1 + max2;
+        accy += may1 + may2;
+        accz += maz1 + maz2;
 
+        Omega += (v2df){0.5, 0.5}*(rinv1_1 + rinv1_2);
+        dWx   += ax1 + ax2;
+        dWy   += ay1 + ay2;
+        dWz   += az1 + az2;
+        
         asm("#SSE-checkpoint3b"); 
       }                     
       force[i].accx = accx;
       force[i].accy = accy;
       force[i].accz = accz;
+      force[i].dWx  = dWx;
+      force[i].dWy  = dWy;
+      force[i].dWz  = dWz;
     }
     asm("#SSE-checkpoint4"); 
-    const real Utot = __builtin_ia32_vec_ext_v2df(__builtin_ia32_haddpd(simdU, simdU), 0);
-#endif  /* _N2FAST */
+
+    U     = reduce(U);
+    Omega = reduce(Omega);
+#if 0
+    U     = __builtin_ia32_haddpd  (U,     U    );
+    U     = __builtin_ia32_unpcklpd(U,     U    );
+    Omega = __builtin_ia32_haddpd  (Omega, Omega);
+    Omega = __builtin_ia32_unpcklpd(Omega, Omega);
+#endif
 
     dt_force += mytimer::get_wtime() - t0;
     flops += PP_FLOP*n*n;
-    return (v2df){Utot, Utot};
   }
 #endif  /* _SSE_ */
 
-#if 0
-  void iterate(const real EPS = 1.0e-13, const real atol = 1.0e-32)
-  {
-    const double t0 = mytimer::get_wtime();
-    const real EP[] = {.4e-1, .16e-2, .64e-4, .256e-5};
-    static real D[7];
-
-    const int n = ptcl.size();
-    const int N = n*6 + 1;
-
-    const int NMAX = 1024*6 + 1;
-    assert(N <= NMAX);
-    static real DT[NMAX][7], YR[NMAX], YS[NMAX], Y[NMAX], S[NMAX];
-
-
-    Particle::Vector y(ptcl);
-    for (int i = 0; i < n; i++)
-    {
-      const int i6 = i*6;
-      Y[i6 + 0] = y[i].pos[0];
-      Y[i6 + 1] = y[i].pos[1];
-      Y[i6 + 2] = y[i].pos[2];
-      Y[i6 + 3] = y[i].vel[0];
-      Y[i6 + 4] = y[i].vel[1];
-      Y[i6 + 5] = y[i].vel[2];
-    }
-    Y[N-1] = y[0].time;
-
-    for (int i = 0; i < N; i++)
-      S[i] = std::abs(YS[i]);
-
-    bool failed = true;
-    real H = h;
-
-    int JTI = 0;
-    real FY = 1.0;
-    real redu = 0.8;
-    real Odot7 = 0.7;
-
-    const int jmax = 10;
-
-    ntry1++;
-    while (failed)
-    {
-      bool BO = false;
-
-      int M  = 1;
-      int JR = 2;
-      int JS = 3;
-
-      for (int j = 0; j < jmax; j++)
-      {
-        ntry++;
-
-        for (int i = 0; i < N; i++)
-        {
-          YS[i] = Y[i];
-          S[i]  = std::max(std::abs(YS[i]), std::abs(S[i]));
-        }
-
-        if (BO)
-        {
-          D[1]=1.777777777777778e0;
-          D[3]=7.111111111111111e0;
-          D[5]=2.844444444444444e1;
-        }
-        else
-        {
-          D[1] = 2.25e0;
-          D[3] = 9.e0;
-          D[5] = 36.0e0;
-        }
-
-        int L;
-        if (j+1 > 7)
-        {
-          L = 7-1;
-          D[6] = 6.4e1;
-        } 
-        else
-        {
-          L = j;
-          D[L] = M*M;
-        }
-
-        bool KONV = L+1 > 3;
-        Multistep(M, H, ptcl, y);
-        for (int i = 0; i < n; i++)
-        {
-          const int i6 = i*6;
-          YS[i6 + 0] = y[i].pos[0];
-          YS[i6 + 1] = y[i].pos[1];
-          YS[i6 + 2] = y[i].pos[2];
-          YS[i6 + 3] = y[i].vel[0];
-          YS[i6 + 4] = y[i].vel[1];
-          YS[i6 + 5] = y[i].vel[2];
-        }
-        YS[N-1] = y[0].time;
-
-        const bool KL = L+1 > 2;
-        const bool GR = L+1 > 5;
-
-        real FS = 0.0;
-
-        for (int i = 0; i < N; i++)
-        {
-          real V = DT[i][0];
-          real C = YS[i];
-          DT[i][0] = C;
-          real TA = C;
-          if (KL)
-          {
-            real W;
-            for (int k = 1; k < L; k++)
-            {
-              real B1 = D[k]*V;
-              real B  = B1 - C;
-              W  = C -  V;
-              real U  = V;
-              if (B != 0.0)
-              {
-                B = W/B;
-                U = C*B;
-                C = B1*B;
-              }
-              V = DT[i][k];
-              DT[i][k] = U;
-              TA = U + TA;
-            }
-            real SI = std::max(S[i], std::abs(TA));
-            if (std::abs(YR[i] - TA) > atol + SI*EPS) KONV = false;
-            if (!(GR || SI == 0.0))
-            {
-              real FV = std::abs(W)/SI;
-              if (FS < FV) FS = FV;
-            }
-          }
-          YR[i] = TA;
-        }
-
-        if (FS != 0.0) 
-        {
-          real FA = FY;
-          int  K  = L - 1;
-          assert(K >= 0);
-          FY = std::pow(EP[K]/FS, 1.0/(L + K));
-          //          fprintf(stderr, " -- M= %d  FY= %g  j= %d \n", M, FY, j);
-          FY = std::min(FY, 1.4);
-          if (!((L+1 != 2 && FY<Odot7*FA)|| FY > Odot7))
-          {
-            H = H*FY;
-            JTI = JTI+1;
-            if (JTI+1 > 25)
-            {
-              H = 0.0;
-              assert(0);
-              return;
-            }
-            failed = true;
-            break;
-          }
-        }
-
-        if (KONV)
-        {
-          for (int i = 0; i < n; i++)
-          {
-            const int i6 = i*6;
-            y[i].pos[0] = YR[i6 + 0];
-            y[i].pos[1] = YR[i6 + 1];
-            y[i].pos[2] = YR[i6 + 2];
-            y[i].vel[0] = YR[i6 + 3];
-            y[i].vel[1] = YR[i6 + 4];
-            y[i].vel[2] = YR[i6 + 5];
-          }
-          y[0].time = YR[N-1];
-          //          fprintf(stderr, "M= %d  h_old= %g h_new= %g  FY= %g \n", M, h, H*FY, FY);
-          h    = H*FY;
-
-          ptcl = y;
-
-          dt = ptcl[0].time - time;
-          time = ptcl[0].time;
-          iteration++;
-#if 0
-          assert(0);
-#endif
-          dt_step += mytimer::get_wtime() - t0;
-          return;
-        }
-
-        D[2] = 4.0e0;
-        D[4] = 1.6e1;
-
-        BO = !BO;
-        M  = JR;
-        JR = JS;
-        JS = M + M;
-      }
-
-      redu = redu*redu + 0.001;
-      H = H*redu;
-      failed = true;
-    }
-
-  }
-#else
   void iterate(const real rtol = 1.0e-13, const real atol = 1.0e-32, const bool dense = false)
   {
     assert(rtol >= 1.0e-15);
@@ -938,179 +682,6 @@ struct Nbody
     iteration++;
     dt_step += mytimer::get_wtime() - t0;
   }
-#endif
-
-  void SymplecticCorrector(const real h, const Particle::Vector &ptcl, Particle::Vector &dPQ, real &dT)
-  {
-    const int n = ptcl.size();
-
-    std::vector< std::pair<vec3, vec3> > force(n);
-
-    real U = 0.0;
-    real T = 0.0;
-    real W = 0.0;
-    const real P = negE0; 
-    for (int i = 0; i < n; i++)
-    {
-      const Particle &pi = ptcl[i];
-      T += pi.Ekin();
-      const real mih = 0.5*pi.mass;
-      vec3 acc = 0.0;
-      vec3 jrk = 0.0;
-      for (int j = 0; j < n; j++)
-      {
-        if (i == j) continue;
-        const Particle &pj = ptcl[j];
-        const vec3 dr = pj.pos - pi.pos;
-        const vec3 dv = pj.vel - pi.vel;
-        const real r2 = dr.norm2();
-        const real rv = dr*dv;
- 
-        const real rinv  = 1.0/std::sqrt(r2);
-        const real rinv2 = rinv    * rinv;
-        const real rinv1 = pj.mass * rinv;
-        const real rinv3 = rinv1   * rinv2;
-        const real alpha = rv*rinv2;
-
-        const vec3 Aij = rinv3*dr;
-        const vec3 Jij = rinv3*dv - (3.0*alpha)*Aij;
-
-        acc += Aij;
-        jrk += Jij;
-        U   += mih*rinv1;
-      }
-      force[i] = std::make_pair(acc, jrk);
-      W       += ptcl[i].mass * (ptcl[i].vel * acc);
-    }
-    const real invU = 1.0/U;
-    const real invP = 1.0/(T + P);
-    const real invF = h*h/24.0*invU*invP;
-
-    W *= -invF;
-
-    for (int i = 0; i < n; i++)
-    {
-      dPQ[i].pos = -1*((W*invP)* ptcl[i].vel   + invF*force[i].first );
-      dPQ[i].vel =  1*((W*invU)*force[i].first + invF*force[i].second);
-    }
-
-    dT = -W*invP;
-  }
-
-  void cvt2symp(const real h, Particle::Vector &ptcl, real &T)
-  {
-    Particle::Vector ptcl0(ptcl), dPQ(ptcl);
-    real T0(T);
-    real dT;
-
-    const int n = ptcl.size();
-
-    int iter = 100;
-    while (1)
-    {
-      SymplecticCorrector(h, ptcl, dPQ, dT);
-      real err = 0.0;
-
-      for (int i = 0; i < n; i++)
-      {
-        vec3 dpos = ptcl[i].pos;
-        vec3 dvel = ptcl[i].vel;
-
-        ptcl[i].pos = ptcl0[i].pos - dPQ[i].pos;
-        ptcl[i].vel = ptcl0[i].vel - dPQ[i].vel;
-        
-        dpos -= ptcl[i].pos;
-        dvel -= ptcl[i].vel;
-
-        err = std::max(err, dpos.norm2()/ptcl[i].pos.norm2());
-        err = std::max(err, dvel.norm2()/ptcl[i].vel.norm2());
-      }
-      real del = T;
-      T = T0 - dT;
-      del -= T;
-      err = std::max(err, SQR(del/T));
-
-
-      err = std::sqrt(err);
-
-      if (err < 1.0e-15) break;
-
-      iter--;
-      assert(iter > 0);
-    }
-  }
-  
-  void cvt2phys(const real h, Particle::Vector &ptcl, real &T)
-  {
-    Particle::Vector dPQ(ptcl);
-    real dT;
-
-    const int n = ptcl.size();
-
-    SymplecticCorrector(h, ptcl, dPQ, dT);
-
-    for (int i = 0; i < n; i++)
-    {
-      ptcl[i].pos += dPQ[i].pos;
-      ptcl[i].vel += dPQ[i].vel;
-
-    }
-    T += dT;
-    assert(T > 0.0);
-  }
-
-#ifdef _SYMPCORR_ /* with symplectic corrector */
-  void Multistep(const int nsteps, const real tau, const Particle::Vector &ptcl_in, Particle::Vector &ptcl)
-  {
-    const double t0 = mytimer::get_wtime();
-    const int nbody = ptcl_in.size();
-    ptcl = ptcl_in;
-    real time = this->time;
-    real h = tau/(real)nsteps;
-
-#if 1
-    cvt2symp(h, ptcl, time);
-#endif
-
-    real T = negE0 + Ekin(ptcl);
-
-    real dth = 0.5*h/T;
-    for (int i = 0; i < nbody; i++)
-      if (ptcl[i].mass > SMALLM)
-        ptcl[i].update_pos(dth);
-    time += dth;
-    for (int k = 0; k < nsteps; k++)
-    {
-      const real U = compute_force(ptcl, force);
-      const real h_over_U = h/(-U);
-      T = 0;
-      for (int i = 0; i < nbody; i++)
-      {
-        if (ptcl[i].mass > SMALLM)
-          ptcl[i].update_vel(h_over_U, force[i].acc);
-        T += ptcl[i].mass*ptcl[i].vel.norm2();
-      }
-      T = 0.5*T + negE0;
-
-      real dth = h/T;
-      if (k == nsteps-1) dth *= 0.5;
-      for (int i = 0; i < nbody; i++)
-        if (ptcl[i].mass > SMALLM)
-          ptcl[i].update_pos(dth);
-      time += dth;
-    }
-
-#if 1
-    cvt2phys(h, ptcl, time);
-#endif
-
-    ptcl[0].time = time;
-
-
-    dt_multi += mytimer::get_wtime() - t0;
-  }
-
-#else /* with symplectic corrector */
 
   void Multistep(const int nsteps, const real tau, const Particle::Vector &ptcl_in, Particle::Vector &ptcl)
   {
@@ -1121,10 +692,12 @@ struct Nbody
 #ifndef _SSE_
 
     real h = tau/(real)nsteps;
-    real T = negE0 + Ekin(ptcl_in);
     real time = this->time;
+    real W    = this->W;
+    real T    = Ekin(ptcl_in);
+    real U, Omega;
 
-    real dth = 0.5*h/T;
+    real dth = 0.5*h/(Alpha*(T + B) + Beta*W + Gamma);
     for (int i = 0; i < nbody; i++)
     {
       ptcl[i] = ptcl_in[i];
@@ -1132,28 +705,35 @@ struct Nbody
         ptcl[i].update_pos(dth);
     }
     time += dth;
+
     for (int k = 0; k < nsteps; k++)
     {
-      const real U = compute_force(ptcl, force);
-      const real h_over_U = h/(-U);
-      T = 0;
+      compute_force(ptcl, force, U, Omega);
+      real dt  = h/(Alpha*U + Beta*Omega + Gamma);
+      real dW = 0.0;
+      real T  = 0.0;
       for (int i = 0; i < nbody; i++)
-      {
         if (ptcl[i].mass > SMALLM)
-          ptcl[i].update_vel(h_over_U, force[i].acc);
-        T += ptcl[i].mass*ptcl[i].vel.norm2();
-      }
-      T = 0.5*T + negE0;
+        {
+          const vec3 v0 = ptcl[i].vel;
+          ptcl[i].update_vel(dt, force[i].acc);
+          dW += force[i].dW*(v0 + ptcl[i].vel);
+          T  += ptcl[i].mass*ptcl[i].vel.norm2();
+        }
+      W += 0.5*dt*dW;
+      T *= 0.5;
 
-      real dth = h/T;
-      if (k == nsteps-1) dth *= 0.5;
+      dt = h/(Alpha*(T + B) + Beta*W + Gamma);
+      if (k == nsteps-1)
+        dt *= 0.5;
       for (int i = 0; i < nbody; i++)
         if (ptcl[i].mass > SMALLM)
-          ptcl[i].update_pos(dth);
-      time += dth;
+          ptcl[i].update_pos(dt);
+      time += dt;
     }
 
     ptcl[0].time = time;
+    ptcl[1].time = W;
 
 #else /* _SSE_ */
 
@@ -1163,11 +743,18 @@ struct Nbody
     const int n = nbody >> 1;
 
     const v2df h = {tau/(real)nsteps, tau/(real)nsteps}; 
-    const v2df negE0v = {negE0, negE0};
-    v2df  time = {this->time, this->time};
+    v2df  time   = {this->time, this->time};
+    v2df  W      = {this->W,    this->W   };
 
+    const v2df Alpha = (v2df){this->Alpha, this->Alpha};
+    const v2df Beta  = (v2df){this->Beta,  this->Beta };
+    const v2df Gamma = (v2df){this->Gamma, this->Gamma};
+    const v2df B     = (v2df){this->B,     this->B};
+    
     const v2df zero = {0.0, 0.0};
     const v2df half = {0.5, 0.5};
+
+    v2df U, Omega;
 
     v2df T = zero;
     for (int i = 0; i < n; i++)
@@ -1175,9 +762,9 @@ struct Nbody
       const ParticleSIMD &p = ptclSIMD[i];
       T += p.mass * (p.velx*p.velx + p.vely*p.vely + p.velz*p.velz);
     }
-    T = half*reduce(T) + negE0v;
+    T = half*reduce(T);
 
-    v2df dth = half*h/T;
+    v2df dth = half*h/(Alpha*(T + B) + Beta*W + Gamma);
     for (int i = 0; i < n; i++)
     {
       ParticleSIMD &p = ptclSIMD[i];
@@ -1191,23 +778,32 @@ struct Nbody
 
     for (int k = 0; k < nsteps; k++)
     {
-      const v2df U = compute_force(ptclSIMD, forceSIMD);
-      v2df dt = h/U;
-      T = zero;
+      compute_force(ptclSIMD, forceSIMD, U, Omega);
+      v2df dt = h/(Alpha*U + Beta*Omega + Gamma);
+      v2df dW = zero;
+      v2df T  = zero;
       for (int i = 0; i < n; i++)
       {
         ParticleSIMD &p = ptclSIMD[i];
         const v2df mask = __builtin_ia32_cmpgtpd(p.mass, (v2df){SMALLM, SMALLM});
         const v2df dt1  = __builtin_ia32_andpd(mask, dt);
+        const v2df vx  = p.velx;
+        const v2df vy  = p.vely;
+        const v2df vz  = p.velz;
         p.velx += forceSIMD[i].accx * dt1;
         p.vely += forceSIMD[i].accy * dt1;
         p.velz += forceSIMD[i].accz * dt1;
+        dW += dt1 * (
+            forceSIMD[i].dWx*(vx + p.velx) +
+            forceSIMD[i].dWy*(vy + p.vely) +
+            forceSIMD[i].dWz*(vz + p.velz));
         T += p.mass * (p.velx*p.velx + p.vely*p.vely + p.velz*p.velz);
       }
-      T = half*reduce(T) + negE0v;
+      W += half*reduce(dW);
+      T  = half*reduce(T);
 
-      dt = h/T;
-      if (k == nsteps-1) 
+      dt = h/(Alpha*(T + B) + Beta*W + Gamma);
+      if (k == nsteps-1)
         dt *= half;
       for (int i = 0; i < n; i++)
       {
@@ -1221,7 +817,6 @@ struct Nbody
       time += dt;
     }
 
-
     for (int i = 0; i < nbody; i += 2)
     {
       ptcl[i  ] = ptclSIMD[i>>1].scalar(0);
@@ -1229,14 +824,13 @@ struct Nbody
     }
 
     ptcl[0].time = __builtin_ia32_vec_ext_v2df(time, 0);
+    ptcl[1].time = __builtin_ia32_vec_ext_v2df(W,    0);
 
 #endif /* _SSE_ */
 
 
     dt_multi += mytimer::get_wtime() - t0;
   }
-#endif
-
 
 #ifndef _RATIONAL_FUNCTIONS_
 
@@ -1375,4 +969,4 @@ struct Nbody
 };
 
 
-#endif /* __LOGH_H__ */
+#endif /* __LogH_TTL_H__ */
