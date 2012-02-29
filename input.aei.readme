@@ -1,6 +1,6 @@
 #bodies #output
 tepoch Tscale
-Tend dt_out dt_log di_log
+Tend dt_out dt_log dt_snap di_log
 tolerance
 mass_scale pos_scale vel_scale
 #idCentre  Mcentre

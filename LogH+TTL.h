@@ -91,7 +91,7 @@ struct Nbody
     dt_step = dt_multi = dt_extra = dt_err = 0.0;
     tbeg = mytimer::get_wtime();
     Alpha = 1.0;
-    Beta  = 0.0e-3;
+    Beta  = 1.0e-2;
     Gamma = 0.0;
 
 #if 0
@@ -213,7 +213,6 @@ struct Nbody
     const real fac = std::sqrt(L.x*L.x + L.y*L.y)/h;
     const real LSMALL = 1.0e-10;
 
-
     double capom, u;
     if (fac < LSMALL)
     {
@@ -235,16 +234,25 @@ struct Nbody
     const double v2 = V.norm2();
     const double vdotr = R*V;
     const double  energy = 0.5*v2 -  Mtot/r; 
+#if 0
+    if (energy >= 0.0)
+    {
+      std::stringstream oss;
+      oss <<  "#" <<  -1; 
+      return oss.str();
+    }
+#endif
+
     assert(energy < 0.0);
 
     double e, f, a, omega, capm;
     {
-      
+
       a = -0.5*Mtot/energy;
       const double fac = 1.0 - h2/(Mtot*a);
       assert(a > 0.0);
 
-    
+
       double cape; 
       if (fac > LSMALL)
       {
@@ -306,7 +314,7 @@ struct Nbody
         const real rinv1 = 1.0/std::sqrt(r2);
         const real rinv2 = rinv1*rinv1;
         const real rinv3 = rinv1*rinv2;
-        
+
         const vec3 aij = rinv3*dr;
 
         iforce.acc += pj.mass*aij;
@@ -327,12 +335,12 @@ struct Nbody
   void compute_force(const ParticleSIMD::Vector &ptcl, ForceSIMD::Vector &force, v2df &U, v2df &Omega)
   {
     const int PP_FLOP = 38;
-    
+
     asm("#SSE-checkpoint1"); 
     const double t0 = mytimer::get_wtime();
     const int n  = this->ptcl.size();
     assert((n&1) == 0);
-    
+
     const int nh = n >> 1;
 
     U = Omega = (v2df){0.0, 0.0};
@@ -351,7 +359,7 @@ struct Nbody
       for (int j = 0; j < nh; j++)
       {
         asm("#SSE-checkpoint3a"); 
-        
+
         const ParticleSIMD p1(ptcl[j], true);
         const ParticleSIMD p2(ptcl[j], false);
 
@@ -373,15 +381,15 @@ struct Nbody
         const v2df rinv3_1 = rinv1_1 * rinv2_1;
         const v2df rinv2_2 = rinv1_2 * rinv1_2;
         const v2df rinv3_2 = rinv1_2 * rinv2_2;
-        
+
         const v2df ax1 = rinv3_1*dx_1;
         const v2df ay1 = rinv3_1*dy_1;
         const v2df az1 = rinv3_1*dz_1;
-        
+
         const v2df ax2 = rinv3_2*dx_2;
         const v2df ay2 = rinv3_2*dy_2;
         const v2df az2 = rinv3_2*dz_2;
-        
+
         const v2df mrinv1_1 = p1.mass*rinv1_1;
         const v2df mrinv3_1 = mrinv1_1 * rinv2_1;
         const v2df mrinv1_2 = p2.mass*rinv1_2;
@@ -390,11 +398,11 @@ struct Nbody
         const v2df max1 = mrinv3_1*dx_1;
         const v2df may1 = mrinv3_1*dy_1;
         const v2df maz1 = mrinv3_1*dz_1;
-        
+
         const v2df max2 = mrinv3_2*dx_2;
         const v2df may2 = mrinv3_2*dy_2;
         const v2df maz2 = mrinv3_2*dz_2;
-        
+
         U    += (v2df){0.5, 0.5}*pi.mass*(mrinv1_1 + mrinv1_2);
         accx += max1 + max2;
         accy += may1 + may2;
@@ -404,7 +412,7 @@ struct Nbody
         dWx   += ax1 + ax2;
         dWy   += ay1 + ay2;
         dWz   += az1 + az2;
-        
+
         asm("#SSE-checkpoint3b"); 
       }                     
       force[i].accx = accx;
@@ -679,6 +687,21 @@ struct Nbody
 
     dt   = ptcl[0].time - time;
     time = ptcl[0].time;
+#if 1
+    W    = ptcl[1].time;
+#else
+#ifdef _SSE_
+    const int nbody = ptcl.size();
+    for (int i = 0; i < nbody; i += 2)
+      ptclSIMD[i>>1] = ParticleSIMD(&ptcl[i]);
+    v2df W1, W2;
+    compute_force(ptclSIMD, forceSIMD, W1, W2);
+    W = __builtin_ia32_vec_ext_v2df(W2, 0);
+#else
+    real W1;
+    compute_force(ptcl, force, W1, W);
+#endif
+#endif
     iteration++;
     dt_step += mytimer::get_wtime() - t0;
   }
@@ -750,7 +773,7 @@ struct Nbody
     const v2df Beta  = (v2df){this->Beta,  this->Beta };
     const v2df Gamma = (v2df){this->Gamma, this->Gamma};
     const v2df B     = (v2df){this->B,     this->B};
-    
+
     const v2df zero = {0.0, 0.0};
     const v2df half = {0.5, 0.5};
 
@@ -847,6 +870,7 @@ struct Nbody
           table[j-1][i].vel = table[j][i].vel + coeff[k][j]*(table[j][i].vel - table[j-1][i].vel);
         }
         table[j-1][0].time = table[j][0].time + coeff[k][j]*(table[j][0].time - table[j-1][0].time);
+        table[j-1][1].time = table[j][1].time + coeff[k][j]*(table[j][1].time - table[j-1][1].time);  /* W */
       }
       for (int i = 0; i < n; i++)
       {
@@ -854,6 +878,7 @@ struct Nbody
         last[i].vel = table[0][i].vel + coeff[k][0]*(table[0][i].vel - last[i].vel);
       }
       last[0].time = table[0][0].time + coeff[k][0]*(table[0][0].time - last[0].time);
+      last[1].time = table[0][1].time + coeff[k][0]*(table[0][1].time - last[1].time);  /* W */
       dt_extra += mytimer::get_wtime() - t0;
     }
 
@@ -867,7 +892,7 @@ struct Nbody
       assert(k > 0);
 
       const real SMALL = 1.0e-30;
-     
+
       static Particle::Vector tmp(n);
 
       for (int j = k-1; j > 0; j--)
@@ -904,6 +929,11 @@ struct Nbody
         const real dt1 = table[j][0].time - tmp       [0].time;
         const real dt_ = coeff[k][j]*(dt1 - dt0) - dt1 + SMALL;
         table[j-1][0].time = table[j][0].time + dt0*dt1 / dt_;
+
+        const real dW0 = table[j][1].time - table[j-1][1].time;
+        const real dW1 = table[j][1].time - tmp       [1].time;
+        const real dW_ = coeff[k][j]*(dW1 - dW0) - dW1 + SMALL;
+        table[j-1][1].time = table[j][1].time + dW0*dW1 / dW_;   /* W */
       }
 
       for (int i = 0; i < n; i++)
@@ -934,8 +964,14 @@ struct Nbody
       const real dt0 = table[0][0].time - last[0].time;
       const real dt1 = table[0][0].time - tmp [0].time;
       const real dt_ = coeff[k][0]*(dt1 - dt0) - dt1 + SMALL;
-      tmp[0].time = 0.0;
+      tmp [0].time = 0.0;
       last[0].time = table[0][0].time + dt0*dt1 / dt_;
+
+      const real dW0 = table[0][1].time - last[1].time;
+      const real dW1 = table[0][1].time - tmp [1].time;
+      const real dW_ = coeff[k][0]*(dW1 - dW0) - dW1 + SMALL;
+      tmp [1].time = 0.0;
+      last[1].time = table[0][1].time + dW0*dW1 / dW_;   /* W */
 
       dt_extra += mytimer::get_wtime() - t0;
     }
@@ -960,10 +996,36 @@ struct Nbody
 #if 1
     const float scale_time = atol + rtol*std::max(std::abs(ysav[0].time), std::abs(y[0].time));
     err = std::max(err, std::abs(float(y[0].time - y1[0].time)/scale_time));
+
+    const float scale_W = atol + rtol*std::max(std::abs(ysav[1].time), std::abs(y[1].time));
+    err = std::max(err, std::abs(float(y[1].time - y1[1].time)/scale_W));
 #endif
 
     dt_err += mytimer::get_wtime() - t0;
     return err;
+  }
+
+
+  std::string print_output() const
+  {
+    const int n = ptcl.size();
+    std::stringstream oss;
+    for (int i = 0; i < n; i++)
+    {
+      oss.precision(15);
+      oss 
+        << i+1 << " "
+        << std::scientific << " "
+        << ptcl[i].mass << " "
+        << ptcl[i].pos.x << " "
+        << ptcl[i].pos.y << " "
+        << ptcl[i].pos.z << " "
+        << ptcl[i].vel.x << " "
+        << ptcl[i].vel.y << " "
+        << ptcl[i].vel.z << " "
+        << std::endl;
+    }
+    return oss.str();
   }
 
 };

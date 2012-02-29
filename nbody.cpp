@@ -1,4 +1,5 @@
 #include <cstdlib>
+#include <fstream>
 
 #if 0
 #include "LogH.h"
@@ -187,17 +188,20 @@ int main(int argc, char * argv[])
   std::cin >> tepoch >> Tscale;
 
   int dI;
-  real Tend, dt_log, dt_out;
-  std::cin >> Tend >> dt_out >> dt_log >> dI;
+  real Tend, dt_log, dt_out, dt_snap;
+  std::cin >> Tend >> dt_out >> dt_log >> dt_snap >> dI;
   assert(dt_out > 0.0);
   assert(dt_log > 0.0);
+  assert(dt_snap > 0.0);
   assert(Tscale > 0.0);
-  const unsigned long long di_iter = dI < 0 ? 1LLU << 63 : dI;
+  const unsigned long long di_iter_max = 1LLU << 62;
+  const unsigned long long di_iter = dI < 0 ? di_iter_max : dI;
 
   fprintf(stderr, " Tepoch= %g   Tscale= %g \n", tepoch, Tscale);
   fprintf(stderr, " Tend= %g \n", Tend);
   fprintf(stderr, " dTout= %g \n", dt_out);
   fprintf(stderr, " dTlog= %g \n", dt_log);
+  fprintf(stderr, " dTsnap= %g \n", dt_snap);
 
   real tolerance;
   std::cin >> tolerance;
@@ -222,8 +226,9 @@ int main(int argc, char * argv[])
 
   real Ep = E0;
 
-  real t_log = 0.0;
-  real t_out = 0;
+  real t_log  = s.time/Tscale;
+  real t_out  = s.time/Tscale;
+  real t_snap = s.time/Tscale;
 
 
   real de_max = 0.0;
@@ -266,6 +271,33 @@ int main(int argc, char * argv[])
       fprintf(stdout, "\n");
       fflush(stdout);
       t_out += dt_out;
+    }
+   
+    if (s.time/Tscale >= t_snap || s.time/Tscale >= Tend)
+    {
+      t_snap += dt_snap;
+      /*************/
+
+      char fn[256];
+      const char path[] = "output";
+      sprintf(fn, "%s/snap_%.8d.out", path, int(t_snap/dt_snap));
+      std::ofstream fout(fn);
+     
+     
+      char o1[256]; 
+      sprintf(o1, "%lld \n", di_iter == di_iter_max ? -1 : di_iter);
+
+      fout.precision(15);
+      fout << s.ptcl.size() << " " << npl << std::endl;
+      fout << s.time << " " << Tscale << std::endl;
+      fout << Tend << " " << dt_out << " " << dt_log  << " " << dt_snap << " " << o1;
+      fout << tolerance << std::endl;
+      fout << "1.0 1.0 1.0 \n";
+      fout << s.print_output();
+
+      fout.close();
+
+      /*************/
     }
   }
 
