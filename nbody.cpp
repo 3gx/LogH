@@ -174,6 +174,12 @@ int main(int argc, char * argv[])
   fpe_catch();
 #endif
 
+  char path[256] = "/tmp/out";
+  if (argc > 1)
+    sprintf(path, "%s", argv[1]);
+
+  fprintf(stderr, " Writing output to %s \n", path);
+
   const real h = 1.0e-5;
   
   unsigned long long iteration = 0;
@@ -279,7 +285,6 @@ int main(int argc, char * argv[])
       /*************/
 
       char fn[256];
-      const char path[] = "output";
       sprintf(fn, "%s/snap_%.8d.out", path, int(t_snap/dt_snap));
       std::ofstream fout(fn);
      
