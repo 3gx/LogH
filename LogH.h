@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <cstdlib>
 
+/* This is LogH only */
+
 /* use this one if run on x86_64 */
 #if 1
 #define _SSE_
