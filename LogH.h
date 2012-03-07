@@ -28,6 +28,7 @@
 
 /* use this option to use rational functoin interpolation instead of polynomial */
 #if 1
+/* with this, use tolernace 1.0e-12, otherwise 1.0e-13*/
 #define _RATIONAL_FUNCTIONS_
 #endif
 
@@ -168,6 +169,28 @@ struct Nbody
 
   real Etot() const {return Ekin(ptcl) + Epot(ptcl);}
   real E0  () const {return -negE0;}
+  
+  std::string print_output() const
+  {
+    const int n = ptcl.size();
+    std::stringstream oss;
+    for (int i = 0; i < n; i++)
+    {
+      oss.precision(15);
+      oss 
+        << i+1 << " "
+        << std::scientific << " "
+        << ptcl[i].mass << " "
+        << ptcl[i].pos.x << " "
+        << ptcl[i].pos.y << " "
+        << ptcl[i].pos.z << " "
+        << ptcl[i].vel.x << " "
+        << ptcl[i].vel.y << " "
+        << ptcl[i].vel.z << " "
+        << std::endl;
+    }
+    return oss.str();
+  }
 
   std::string print_orbit(const int i) const
   {

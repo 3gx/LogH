@@ -19,6 +19,7 @@
 
 /* use this option to use rational functoin interpolation instead of polynomial */
 #if 1
+/* with this, use tolernace 1.0e-12, otherwise 1.0e-13*/
 #define _RATIONAL_FUNCTIONS_
 #endif
 
@@ -687,9 +688,7 @@ struct Nbody
 
     dt   = ptcl[0].time - time;
     time = ptcl[0].time;
-#if 1
-    W    = ptcl[1].time;
-#else
+#if 0
 #ifdef _SSE_
     const int nbody = ptcl.size();
     for (int i = 0; i < nbody; i += 2)
@@ -701,6 +700,8 @@ struct Nbody
     real W1;
     compute_force(ptcl, force, W1, W);
 #endif
+#else
+    W    = ptcl[1].time;
 #endif
     iteration++;
     dt_step += mytimer::get_wtime() - t0;

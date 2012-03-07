@@ -56,7 +56,7 @@ Particle::Vector read_xyz(const int nbody)
     mass *= mass_scale;
     pos  *= pos_scale;
     vel  *= vel_scale;
-#if 0
+#if 1
     fprintf(stderr, " i =%d : mass= %g  pos= %g %g %g (r= %g)   vel= %g %g %g  (v= %g)   cos(r,v)= %g\n",
         i, mass,
         pos.x, pos.y, pos.z, pos.abs(),
